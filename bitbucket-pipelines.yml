@@ -1,0 +1,723 @@
+image: atlassian/default-image:3
+definitions:
+  services:
+    postgres:
+      image: postgres:12
+      variables:
+        POSTGRES_DB: $POSTGRES_DB
+        POSTGRES_USER: $POSTGRES_USER
+        POSTGRES_PASSWORD: $POSTGRES_PASSWORD
+
+    localstack:
+      image: localstack/localstack:latest
+pipelines:
+  default:
+    - step:
+        name: Lint_and_Test
+        image: python:3.9
+        script:
+          - make -f Makefile.pipeline install
+          - make -f Makefile.pipeline local-migrate
+          - make -f Makefile.pipeline lint
+          - make -f Makefile.pipeline test-local
+        services:
+          - postgres
+          - localstack
+  branches:
+    develop:
+      - step:
+          name: Lint_and_Test
+          image: python:3.9
+          script:
+            - make -f Makefile.pipeline install
+            - make -f Makefile.pipeline local-migrate
+            - make -f Makefile.pipeline lint
+            - make -f Makefile test-local
+          services:
+           - postgres
+           - localstack
+      - step:
+          name: Build and push backend
+          script:
+            - cp docker/Dockerfile-deploy .
+            - docker build -f Dockerfile-deploy . -t $IMAGE_NAME:latest -t $IMAGE_NAME:$BITBUCKET_COMMIT
+            - pipe: atlassian/aws-ecr-push-image:1.5.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                IMAGE_NAME: $IMAGE_NAME
+                TAGS: '${BITBUCKET_COMMIT} latest'
+      - step:
+          name: Install Helm Charts to AWS Dev Env
+          script:
+            - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            - unzip awscliv2.zip
+            - ./aws/install
+            - mkdir -p ~/.aws
+            - echo -e "[default]\n" > ~/.aws/credentials
+            - echo -e "aws_access_key_id = $AWS_ACCESS_KEY_ID\n" >> ~/.aws/credentials
+            - echo -e "aws_secret_access_key = $AWS_SECRET_ACCESS_KEY\n" >> ~/.aws/credentials
+            - echo -e "output=$OUTPUT_FORMAT\n" >> ~/.aws/credentials
+            - echo -e "region=$AWS_DEFAULT_REGION\n" >> ~/.aws/credentials
+            - cat ~/.aws/credentials      
+            - aws sts get-caller-identity
+            - aws eks --region $AWS_DEFAULT_REGION update-kubeconfig --name dev
+            - cat ~/.kube/config
+            - apt-get update && apt-get install -y apt-transport-https
+            - curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+            - echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" | tee -a /etc/apt/sources.list.d/kubernetes.list
+            - apt-get update
+            - apt-get install -y kubectl
+            - curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+            - chmod 700 get_helm.sh
+            - ./get_helm.sh
+            - helm version
+            - cp helm/backend/vars.sh .
+            - ./vars.sh
+            - sed -i "s/tag.*/tag\:\ $BITBUCKET_COMMIT/" helm/backend/dev-values.yaml
+            - cat helm/backend/dev-values.yaml
+            - helm upgrade --install --debug --dry-run backend --namespace develop -f ./helm/backend/dev-values.yaml ./helm/backend
+            - helm upgrade --install backend --namespace develop -f ./helm/backend/dev-values.yaml ./helm/backend                           
+      - parallel:   
+          - step:
+              name: Build and deploy lambda init_csv_file_by_sftp
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - docker build --file=docker/Dockerfile-lambda-init-csv-file-by-sftp --build-arg BUILD_RELEASE=dev . -t lambda-init-csv-file-by-sftp:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: lambda-init-csv-file-by-sftp
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name $LAMBDA_INIT_CSV_FILE_BY_SFTP --image-uri $(aws lambda get-function --function-name $LAMBDA_INIT_CSV_FILE_BY_SFTP | jq -r '.Code.ImageUri')
+
+          - step:
+              name: Build and deploy lambda init_csv_file_by_sftp_time_expiration
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - docker build --file=docker/Dockerfile-lambda-init-csv-file-by-sftp-time-expired --build-arg BUILD_RELEASE=dev . -t lambda-init-csv-file-by-sftp-time-expired:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: lambda-init-csv-file-by-sftp-time-expired
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name $LAMBDA_INIT_CSV_FILE_BY_SFTP_TIME_EXPIRED --image-uri $(aws lambda get-function --function-name $LAMBDA_INIT_CSV_FILE_BY_SFTP_TIME_EXPIRED | jq -r '.Code.ImageUri')
+
+          - step:
+              name: Build and deploy lambda check_confirmation_email
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - docker build --file=docker/Dockerfile-lambda-check-confirmation-email --build-arg BUILD_RELEASE=dev . -t lambda-check-confirmation-email:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: lambda-check-confirmation-email
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name $LAMBDA_CHECK_CONFIRMATION_EMAIL --image-uri $(aws lambda get-function --function-name $LAMBDA_CHECK_CONFIRMATION_EMAIL | jq -r '.Code.ImageUri')
+
+          - step:
+              name: Build and deploy lambda trace_file_service
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - cp server/core/download_ssh_for_sftp.py .
+                - sed -i "s/AWS_ACCESS_KEY_ID=/AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID/g" ./.env
+                - sed -i "s/AWS_SECRET_ACCESS_KEY=/AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY/g" ./.env
+                - docker build --file=docker/Dockerfile-lambda-check-trase-file-from-evolve --build-arg BUILD_RELEASE=dev . -t lambda-check-trase-file-from-evolve:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: lambda-check-trase-file-from-evolve
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name $LAMBDA_CHECK_TEASE_FILE_FROM_EVOLVE --image-uri $(aws lambda get-function --function-name $LAMBDA_CHECK_TEASE_FILE_FROM_EVOLVE | jq -r '.Code.ImageUri')
+
+          - step:
+              name: Build and deploy lambda process_return_file_service
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - docker build --file=docker/Dockerfile-lambda-process-return-file --build-arg BUILD_RELEASE=dev . -t lambda-process-return-file:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: lambda-process-return-file
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name $LAMBDA_PROCESS_RETURN_FILE --image-uri $(aws lambda get-function --function-name $LAMBDA_PROCESS_RETURN_FILE | jq -r '.Code.ImageUri')            
+
+          - step:
+              name: Build and deploy lambda transaction initiation
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - cp server/core/download_ssh_for_sftp.py .
+                - sed -i "s/AWS_ACCESS_KEY_ID=/AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID/g" ./.env
+                - sed -i "s/AWS_SECRET_ACCESS_KEY=/AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY/g" ./.env
+                - docker build --file=docker/Dockerfile-lambda-transactions-initiation --build-arg BUILD_RELEASE=dev . -t lambda-transactions-initiation:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: lambda-transactions-initiation
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name $LAMBDA_TRANSACTIONS_INITIATION --image-uri $(aws lambda get-function --function-name $LAMBDA_TRANSACTIONS_INITIATION | jq -r '.Code.ImageUri')
+          - step:
+              name: Build and deploy lambda daily check
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - cp server/core/download_ssh_for_sftp.py .
+                - sed -i "s/AWS_ACCESS_KEY_ID=/AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID/g" ./.env
+                - sed -i "s/AWS_SECRET_ACCESS_KEY=/AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY/g" ./.env                              
+                - docker build --file=docker/Dockerfile-lambda-daily-check-ach-files --build-arg BUILD_RELEASE=dev . -t lambda-daily-check-ach-files:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: lambda-daily-check-ach-files
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name $LAMBDA_DAILY_CHECK_ACH_FILES --image-uri $(aws lambda get-function --function-name $LAMBDA_DAILY_CHECK_ACH_FILES | jq -r '.Code.ImageUri')
+          - step:
+              name: Build and deploy lambda manual-ach-initiation
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - cp server/core/download_ssh_for_sftp.py .
+                - sed -i "s/AWS_ACCESS_KEY_ID=/AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID/g" ./.env
+                - sed -i "s/AWS_SECRET_ACCESS_KEY=/AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY/g" ./.env                              
+                - docker build --file=docker/Dockerfile-lambda-manual-ach-initiation --build-arg BUILD_RELEASE=dev . -t lambda-manual-ach-initiation:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: lambda-manual-ach-initiation
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name $LAMBDA_MANUAL_ACH_INITIATION --image-uri $(aws lambda get-function --function-name $LAMBDA_MANUAL_ACH_INITIATION | jq -r '.Code.ImageUri')
+              services:
+                - docker
+          - step:
+              name: Build and deploy lambda Copy-trace-file
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - cp server/core/download_ssh_for_sftp.py .
+                - sed -i "s/AWS_ACCESS_KEY_ID=/AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID/g" ./.env
+                - sed -i "s/AWS_SECRET_ACCESS_KEY=/AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY/g" ./.env                
+                - docker build --file=docker/Dockerfile-lambda-copy-trace-files-lambda --build-arg BUILD_RELEASE=dev . -t lambda-copy-trace-file:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: lambda-copy-trace-file
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name lambda-copy-trace-files --image-uri $(aws lambda get-function --function-name lambda-copy-trace-files | jq -r '.Code.ImageUri')
+              services:
+                - docker
+          - step:
+              name: Build and deploy lambda Copy-return-file
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - cp server/core/download_ssh_for_sftp.py .
+                - sed -i "s/AWS_ACCESS_KEY_ID=/AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID/g" ./.env
+                - sed -i "s/AWS_SECRET_ACCESS_KEY=/AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY/g" ./.env                              
+                - docker build --file=docker/Dockerfile-lambda-copy-return-files-lambda --build-arg BUILD_RELEASE=dev . -t lambda-copy-return-files:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: lambda-copy-return-files
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name lambda-copy-return-files --image-uri $(aws lambda get-function --function-name lambda-copy-return-files | jq -r '.Code.ImageUri')
+              services:
+                - docker
+    backend-test-env:
+      - step:
+          name: Build and push backend
+          script:
+            - cp docker/Dockerfile-deploy .
+            - docker build -f Dockerfile-deploy . -t $IMAGE_NAME:latest -t $IMAGE_NAME:test-$BITBUCKET_COMMIT
+            - pipe: atlassian/aws-ecr-push-image:1.5.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                IMAGE_NAME: $IMAGE_NAME
+                TAGS: 'test-${BITBUCKET_COMMIT} latest'
+      - step:
+          name: Install Helm Charts to AWS TEST Env
+          script:
+            - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            - unzip awscliv2.zip
+            - ./aws/install
+            - mkdir -p ~/.aws
+            - echo -e "[default]\n" > ~/.aws/credentials
+            - echo -e "aws_access_key_id = $AWS_ACCESS_KEY_ID\n" >> ~/.aws/credentials
+            - echo -e "aws_secret_access_key = $AWS_SECRET_ACCESS_KEY\n" >> ~/.aws/credentials
+            - echo -e "output=$OUTPUT_FORMAT\n" >> ~/.aws/credentials
+            - echo -e "region=$AWS_DEFAULT_REGION\n" >> ~/.aws/credentials
+            - cat ~/.aws/credentials      
+            - aws sts get-caller-identity
+            - aws eks --region $AWS_DEFAULT_REGION update-kubeconfig --name dev
+            - cat ~/.kube/config
+            - apt-get update && apt-get install -y apt-transport-https
+            - curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+            - echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" | tee -a /etc/apt/sources.list.d/kubernetes.list
+            - apt-get update
+            - apt-get install -y kubectl
+            - curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+            - chmod 700 get_helm.sh
+            - ./get_helm.sh
+            - helm version
+            - cp helm/backend/vars-test.sh .
+            - ./vars-test.sh            
+            - sed -i "s/tag.*/tag\:\ test-$BITBUCKET_COMMIT/" helm/backend/test-values.yaml
+            - helm upgrade --install --debug --dry-run backend --namespace pg-test -f ./helm/backend/test-values.yaml ./helm/backend
+            - helm upgrade --install backend --namespace pg-test -f ./helm/backend/test-values.yaml ./helm/backend                           
+      - parallel:   
+          - step:
+              name: Build and deploy lambda init_csv_file_by_sftp
+              trigger: 'manual'
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - aws lambda update-function-code --function-name $LAMBDA_INIT_CSV_FILE_BY_SFTP --image-uri $(aws lambda get-function --function-name $LAMBDA_INIT_CSV_FILE_BY_SFTP | jq -r '.Code.ImageUri')
+
+          - step:
+              name: Build and deploy lambda init_csv_file_by_sftp_time_expiration
+              trigger: 'manual'
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - aws lambda update-function-code --function-name $LAMBDA_INIT_CSV_FILE_BY_SFTP_TIME_EXPIRED --image-uri $(aws lambda get-function --function-name $LAMBDA_INIT_CSV_FILE_BY_SFTP_TIME_EXPIRED | jq -r '.Code.ImageUri')
+
+          - step:
+              name: Build and deploy lambda check_confirmation_email
+              trigger: 'manual'
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - aws lambda update-function-code --function-name $LAMBDA_CHECK_CONFIRMATION_EMAIL --image-uri $(aws lambda get-function --function-name $LAMBDA_CHECK_CONFIRMATION_EMAIL | jq -r '.Code.ImageUri')
+
+          - step:
+              name: Build and deploy lambda trace_file_service
+              trigger: 'manual'
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - aws lambda update-function-code --function-name $LAMBDA_CHECK_TEASE_FILE_FROM_EVOLVE --image-uri $(aws lambda get-function --function-name $LAMBDA_CHECK_TEASE_FILE_FROM_EVOLVE | jq -r '.Code.ImageUri')
+          - step:
+              name: Build and deploy lambda process_return_file_service
+              trigger: 'manual'
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - aws lambda update-function-code --function-name $LAMBDA_PROCESS_RETURN_FILE --image-uri $(aws lambda get-function --function-name $LAMBDA_PROCESS_RETURN_FILE | jq -r '.Code.ImageUri')            
+
+          - step:
+              name: Build and deploy lambda transaction initiation
+              trigger: 'manual'
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - aws lambda update-function-code --function-name $LAMBDA_TRANSACTIONS_INITIATION --image-uri $(aws lambda get-function --function-name $LAMBDA_TRANSACTIONS_INITIATION | jq -r '.Code.ImageUri')
+          - step:
+              name: Build and deploy lambda daily check
+              trigger: 'manual'
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - aws lambda update-function-code --function-name $LAMBDA_DAILY_CHECK_ACH_FILES --image-uri $(aws lambda get-function --function-name $LAMBDA_DAILY_CHECK_ACH_FILES | jq -r '.Code.ImageUri')
+          - step:
+              name: Build and deploy lambda manual-ach-initiation
+              trigger: 'manual'
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - aws lambda update-function-code --function-name $LAMBDA_MANUAL_ACH_INITIATION --image-uri $(aws lambda get-function --function-name $LAMBDA_MANUAL_ACH_INITIATION | jq -r '.Code.ImageUri')
+              services:
+                - docker
+          - step:
+              name: Build and deploy lambda Copy-trace-file
+              trigger: 'manual'
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - aws lambda update-function-code --function-name lambda-copy-trace-files --image-uri $(aws lambda get-function --function-name lambda-copy-trace-files | jq -r '.Code.ImageUri')
+              services:
+                - docker
+          - step:
+              name: Build and deploy lambda Copy-return-file
+              trigger: 'manual'
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - aws lambda update-function-code --function-name lambda-copy-return-files --image-uri $(aws lambda get-function --function-name lambda-copy-return-files | jq -r '.Code.ImageUri')
+              services:
+                - docker
+    master:
+      - step:
+          name: Lint_and_Test
+          condition:
+            changesets:
+              includePaths:
+                - "version.txt"          
+          image: python:3.9
+          script:
+            - make -f Makefile.pipeline install
+            - make -f Makefile.pipeline local-migrate
+            - make -f Makefile.pipeline lint
+            - make -f Makefile test-local
+          services:
+           - postgres
+           - localstack
+      - step:
+          name: Build and push backend
+          condition:
+            changesets:
+              includePaths:
+                - "version.txt"           
+          script:
+            - source version.txt
+            - export $(cut -d= -f1 version.txt)
+            - echo "$TAG"
+            - git checkout master
+            - git tag -a $TAG -m "$TAG" 
+            - git push --atomic origin master $TAG           
+            - cp docker/Dockerfile-deploy-prod .
+            - docker build -f Dockerfile-deploy-prod . -t $IMAGE_NAME_PROD:latest -t $IMAGE_NAME:$TAG
+            - pipe: atlassian/aws-ecr-push-image:1.5.0
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                IMAGE_NAME: $IMAGE_NAME_PROD
+                TAGS: '${TAG} latest'
+      - step:
+          name: Install Helm Charts to AWS PROD Env
+          condition:
+            changesets:
+              includePaths:
+                - "version.txt"           
+          script:
+            - source version.txt
+            - export $(cut -d= -f1 version.txt)
+            - echo "$TAG"          
+            - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            - unzip awscliv2.zip
+            - ./aws/install
+            - mkdir -p ~/.aws
+            - echo -e "[default]\n" > ~/.aws/credentials
+            - echo -e "aws_access_key_id = $AWS_ACCESS_KEY_ID\n" >> ~/.aws/credentials
+            - echo -e "aws_secret_access_key = $AWS_SECRET_ACCESS_KEY\n" >> ~/.aws/credentials
+            - echo -e "output=$OUTPUT_FORMAT\n" >> ~/.aws/credentials
+            - echo -e "region=$AWS_DEFAULT_REGION\n" >> ~/.aws/credentials
+            - cat ~/.aws/credentials      
+            - aws sts get-caller-identity
+            - aws eks --region $AWS_DEFAULT_REGION update-kubeconfig --name prod_paygears
+            - cat ~/.kube/config
+            - apt-get update && apt-get install -y apt-transport-https
+            - curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+            - echo "deb https://apt.kubernetes.io/ kubernetes-xenial main" | tee -a /etc/apt/sources.list.d/kubernetes.list
+            - apt-get update
+            - apt-get install -y kubectl
+            - curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+            - chmod 700 get_helm.sh
+            - ./get_helm.sh
+            - helm version
+            - cp helm/backend/vars-prod.sh .
+            - ./vars-prod.sh
+            - cat ./helm/backend/prod-values.yaml
+            - sed -i "s/tag.*/tag\:\ $TAG/" helm/backend/prod-values.yaml
+            - helm upgrade --install --debug --dry-run backend --namespace prod-paygears  -f ./helm/backend/prod-values.yaml ./helm/backend
+            - helm upgrade --install backend --namespace prod-paygears  -f ./helm/backend/prod-values.yaml ./helm/backend                           
+      - parallel:   
+          - step:
+              name: Build and deploy lambda init_csv_file_by_sftp
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - docker build --file=docker/Dockerfile-lambda-init-csv-file-by-sftp --build-arg BUILD_RELEASE=dev . -t prod-lambda-init-csv-file-by-sftp:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: prod-lambda-init-csv-file-by-sftp
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name prod_lambda_init_csv_file_by_sftp --image-uri $(aws lambda get-function --function-name prod_lambda_init_csv_file_by_sftp | jq -r '.Code.ImageUri')
+
+          - step:
+              name: Build and deploy lambda init_csv_file_by_sftp_time_expiration
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - docker build --file=docker/Dockerfile-lambda-init-csv-file-by-sftp-time-expired --build-arg BUILD_RELEASE=dev . -t prod-lambda-init-csv-file-by-sftp-time-expired:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: prod-lambda-init-csv-file-by-sftp-time-expired
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name prod_lambda_init_csv_file_by_sftp_time_expired --image-uri $(aws lambda get-function --function-name prod_lambda_init_csv_file_by_sftp_time_expired | jq -r '.Code.ImageUri')
+
+          - step:
+              name: Build and deploy lambda check_confirmation_email
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - docker build --file=docker/Dockerfile-lambda-check-confirmation-email --build-arg BUILD_RELEASE=dev . -t prod-lambda-check-confirmation-email:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: prod-lambda-check-confirmation-email
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name prod-lambda-check-email --image-uri $(aws lambda get-function --function-name prod-lambda-check-email | jq -r '.Code.ImageUri')
+
+          - step:
+              name: Build and deploy lambda trace_file_service
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - cp server/core/download_ssh_for_sftp.py .
+                - sed -i "s/AWS_ACCESS_KEY_ID=/AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID/g" ./.env
+                - sed -i "s/AWS_SECRET_ACCESS_KEY=/AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY/g" ./.env
+                - sed -i "s/AWS_SECRET_MANAGER_NAME=private_ssh_key_for_test_sftp/AWS_SECRET_MANAGER_NAME=private_ssh_key_for_prod_sftp/g" ./.env
+                - sed -i "s/AWS_SECRET_MANAGER_KEY_NAME=private_ssh_key_for_test_sftp/AWS_SECRET_MANAGER_KEY_NAME=private_ssh_key_for_prod_sftp/g" ./.env                
+                - docker build --file=docker/Dockerfile-lambda-check-trase-file-from-evolve --build-arg BUILD_RELEASE=dev . -t prod-lambda-check-trase-file-from-evolve:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: prod-lambda-check-trase-file-from-evolve
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name prod_lambda_check_trase_file_from_evolve --image-uri $(aws lambda get-function --function-name prod_lambda_check_trase_file_from_evolve | jq -r '.Code.ImageUri')
+
+          - step:
+              name: Build and deploy lambda process_return_file_service
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - docker build --file=docker/Dockerfile-lambda-process-return-file --build-arg BUILD_RELEASE=dev . -t prod-lambda-process-return-file:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: prod-lambda-process-return-file
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name prod_lambda_process_return_file --image-uri $(aws lambda get-function --function-name prod_lambda_process_return_file | jq -r '.Code.ImageUri')            
+
+          - step:
+              name: Build and deploy lambda transaction initiation
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - cp server/core/download_ssh_for_sftp.py .
+                - sed -i "s/AWS_ACCESS_KEY_ID=/AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID/g" ./.env
+                - sed -i "s/AWS_SECRET_ACCESS_KEY=/AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY/g" ./.env
+                - sed -i "s/AWS_SECRET_MANAGER_NAME=private_ssh_key_for_test_sftp/AWS_SECRET_MANAGER_NAME=private_ssh_key_for_prod_sftp/g" ./.env
+                - sed -i "s/AWS_SECRET_MANAGER_KEY_NAME=private_ssh_key_for_test_sftp/AWS_SECRET_MANAGER_KEY_NAME=private_ssh_key_for_prod_sftp/g" ./.env                
+                - docker build --file=docker/Dockerfile-lambda-transactions-initiation --build-arg BUILD_RELEASE=dev . -t prod-lambda-transactions-initiation:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: prod-lambda-transactions-initiation
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name prod-ach-initiation --image-uri $(aws lambda get-function --function-name prod-ach-initiation | jq -r '.Code.ImageUri')
+          - step:
+              name: Build and deploy lambda daily check
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - cp server/core/download_ssh_for_sftp.py .
+                - sed -i "s/AWS_ACCESS_KEY_ID=/AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID/g" ./.env
+                - sed -i "s/AWS_SECRET_ACCESS_KEY=/AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY/g" ./.env
+                - sed -i "s/AWS_SECRET_MANAGER_NAME=private_ssh_key_for_test_sftp/AWS_SECRET_MANAGER_NAME=private_ssh_key_for_prod_sftp/g" ./.env
+                - sed -i "s/AWS_SECRET_MANAGER_KEY_NAME=private_ssh_key_for_test_sftp/AWS_SECRET_MANAGER_KEY_NAME=private_ssh_key_for_prod_sftp/g" ./.env                                              
+                - docker build --file=docker/Dockerfile-lambda-daily-check-ach-files --build-arg BUILD_RELEASE=dev . -t prod-lambda-daily-check-ach-files:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: prod-lambda-daily-check-ach-files
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name prod_lambda_daily_check_ach_files --image-uri $(aws lambda get-function --function-name prod_lambda_daily_check_ach_files | jq -r '.Code.ImageUri')
+          - step:
+              name: Build and deploy lambda manual-ach-initiation
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - cp server/core/download_ssh_for_sftp.py .
+                - sed -i "s/AWS_ACCESS_KEY_ID=/AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID/g" ./.env
+                - sed -i "s/AWS_SECRET_ACCESS_KEY=/AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY/g" ./.env
+                - sed -i "s/AWS_SECRET_MANAGER_NAME=private_ssh_key_for_test_sftp/AWS_SECRET_MANAGER_NAME=private_ssh_key_for_prod_sftp/g" ./.env
+                - sed -i "s/AWS_SECRET_MANAGER_KEY_NAME=private_ssh_key_for_test_sftp/AWS_SECRET_MANAGER_KEY_NAME=private_ssh_key_for_prod_sftp/g" ./.env                                              
+                - docker build --file=docker/Dockerfile-lambda-manual-ach-initiation --build-arg BUILD_RELEASE=dev . -t lambda-manual-ach-initiation:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: lambda-manual-ach-initiation
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name $LAMBDA_MANUAL_ACH_INITIATION --image-uri $(aws lambda get-function --function-name $LAMBDA_MANUAL_ACH_INITIATION | jq -r '.Code.ImageUri')
+              services:
+                - docker
+          - step:
+              name: Build and deploy lambda Copy-trace-file
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - cp server/core/download_ssh_for_sftp.py .
+                - sed -i "s/AWS_ACCESS_KEY_ID=/AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID/g" ./.env
+                - sed -i "s/AWS_SECRET_ACCESS_KEY=/AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY/g" ./.env
+                - sed -i "s/AWS_SECRET_MANAGER_NAME=private_ssh_key_for_test_sftp/AWS_SECRET_MANAGER_NAME=private_ssh_key_for_prod_sftp/g" ./.env
+                - sed -i "s/AWS_SECRET_MANAGER_KEY_NAME=private_ssh_key_for_test_sftp/AWS_SECRET_MANAGER_KEY_NAME=private_ssh_key_for_prod_sftp/g" ./.env                                
+                - docker build --file=docker/Dockerfile-lambda-copy-trace-files-lambda --build-arg BUILD_RELEASE=dev . -t prod-lambda-copy-trace-file:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: prod-lambda-copy-trace-file
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name prod_lambda_copy_trace_files --image-uri $(aws lambda get-function --function-name prod_lambda_copy_trace_files | jq -r '.Code.ImageUri')
+              services:
+                - docker
+          - step:
+              name: Build and deploy lambda Copy-return-file
+              image: atlassian/pipelines-awscli:latest
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+              script:
+                - cp server/core/download_ssh_for_sftp.py .
+                - sed -i "s/AWS_ACCESS_KEY_ID=/AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID/g" ./.env
+                - sed -i "s/AWS_SECRET_ACCESS_KEY=/AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY/g" ./.env
+                - sed -i "s/AWS_SECRET_MANAGER_NAME=private_ssh_key_for_test_sftp/AWS_SECRET_MANAGER_NAME=private_ssh_key_for_prod_sftp/g" ./.env
+                - sed -i "s/AWS_SECRET_MANAGER_KEY_NAME=private_ssh_key_for_test_sftp/AWS_SECRET_MANAGER_KEY_NAME=private_ssh_key_for_prod_sftp/g" ./.env                                              
+                - docker build --file=docker/Dockerfile-lambda-copy-return-files-lambda --build-arg BUILD_RELEASE=dev . -t prod-lambda-copy-return-files:latest
+                - pipe: atlassian/aws-ecr-push-image:1.5.0
+                  variables:
+                    AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                    AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                    AWS_DEFAULT_REGION: $AWS_DEFAULT_REGION
+                    IMAGE_NAME: prod-lambda-copy-return-files
+                    TAGS: 'latest'
+                - aws lambda update-function-code --function-name prod_lambda_copy_return_files --image-uri $(aws lambda get-function --function-name prod_lambda_copy_return_files | jq -r '.Code.ImageUri')
+              services:
+                - docker

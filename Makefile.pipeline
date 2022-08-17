@@ -1,0 +1,54 @@
+.EXPORT_ALL_VARIABLES:
+SOURCE_FILES ?= server
+
+DOTENV_BASE_FILE ?= .pipeline_env
+-include $(DOTENV_BASE_FILE)
+
+POETRY_EXPORT_WITHOUT_INDEXES ?= true
+POETRY_EXPORT_OUTPUT = requirements.txt
+POETRY_VERSION = 1.1.4
+POETRY ?= $(HOME)/.poetry/bin/poetry
+
+MIGRATIONS_DB_CONFIG = server/alembic.ini
+
+.PHONY: install-poetry
+install-poetry:
+	curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python
+
+.PHONY: install-packages
+install-packages:
+	$(POETRY) install
+
+.PHONY: install
+install: install-poetry install-packages
+
+.PHONY: lint-bandit
+lint-bandit:
+	$(POETRY) run bandit --ini .bandit --recursive
+
+.PHONY: lint-black
+lint-black:
+	$(POETRY) run black --check --diff ./$(SOURCE_FILES)
+
+.PHONY: lint-flake8
+lint-flake8:
+	$(POETRY) run flake8 ./$(SOURCE_FILES)
+
+.PHONY: lint-isort
+lint-isort:
+	$(POETRY) run isort --check-only --diff ./$(SOURCE_FILES)
+
+.PHONY: lint-mypy
+lint-mypy:
+	$(POETRY) run mypy
+
+.PHONY: lint
+lint: lint-black lint-flake8 lint-isort # lint-bandit
+
+.PHONY: test-local
+test-local:
+	$(POETRY) run pytest tests/.
+
+.PHONY: local-migrate
+local-migrate:
+	$(POETRY) run alembic --config $(MIGRATIONS_DB_CONFIG) upgrade head

@@ -1,0 +1,23 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+fastapi = "*"
+sqlalchemy = "*"
+asyncpg = "*"
+alembic = "*"
+psycopg2-binary = "*"
+pytest-asyncio = "*"
+asyncmock = "*"
+asynctest = "*"
+pytest-mock = "*"
+black = "*"
+isort = "*"
+bandit = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.9"

@@ -1,0 +1,20 @@
+[flake8]
+exclude =(
+    .git,
+    __pycache__,
+    migrations,
+    venv,
+)
+per-file-ignores = __init__.py: F401
+
+max-line-length = 120
+
+radon-max-cc = 7
+radon-no-assert = true
+
+# All checks with some warnings(most of them are ok but they may reveal new ones that are not checked in other settings)
+#ignore = W291,W503,E303
+# Settings to exclude warnings(those that are normal and cannot be adequately corrected)
+# E711,E712 - quite important check, doesn't work correctly with sqlalchemy queries,
+# this can be fixed with the is_ operator, but it looks like an unnecessary solution
+ignore = W291,W503,E303,E711,E712,E203
