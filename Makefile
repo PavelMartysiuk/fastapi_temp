@@ -91,5 +91,9 @@ alembic-history:
 alembic-merge-heads:
 	docker-compose exec backend alembic --config $(MIGRATIONS_DB_CONFIG) merge heads
 
+.PHONY: service
+service:
+	python3 server/main.py
+
 
 
